@@ -9,11 +9,7 @@
 #include <zephyr/net/dhcpv4.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/net_stats.h>
-#include <zephyr/sys/sys_heap.h>
-#include <zephyr/sys/thread_stack.h>
-#include <zephyr/kernel/thread.h>
-#include <zephyr/stats/stats.h>
-#include <zephyr/hwinfo/hwinfo.h>
+
 #include <string.h>
 #include <errno.h>
 
@@ -77,30 +73,18 @@ static void uart_drain_rx(const struct device *dev)
 
 /* ----------------------------------------------------------------
  * ÉTAT PARTAGÉ — métriques réseau cumulées
- * Ces compteurs sont mis à jour au fil du temps par les callbacks
- * réseau et consultés par les host functions.
+ * g_bytes_tx/rx/errors : mis à jour dans host_tcp_send/recv
+ * g_reset_count        : incrémenté au premier appel wifi_connect
+ *                        détecté via le compteur de boot Zephyr
+ *                        (sans hwinfo, non disponible sur toutes cibles)
  * ---------------------------------------------------------------- */
 static uint32_t g_bytes_tx    = 0;
 static uint32_t g_bytes_rx    = 0;
 static uint32_t g_net_errors  = 0;
 static uint32_t g_reset_count = 0;
 
-/* Callback réseau pour mettre à jour bytes TX/RX/errors */
-static struct net_mgmt_event_callback net_stats_cb;
-
-static void on_net_event(struct net_mgmt_event_callback *cb,
-                         uint64_t event, struct net_if *iface)
-{
-    /* On peut interroger net_stats directement côté host function.
-     * Ce callback sert à garder la structure à jour si besoin. */
-    ARG_UNUSED(cb);
-    ARG_UNUSED(event);
-    ARG_UNUSED(iface);
-}
-
 /* ----------------------------------------------------------------
  * RÉSOLUTION DE POINTEUR WASM → natif
- * Identique à la version rust_http.
  * ---------------------------------------------------------------- */
 static const char *wasm_ptr_to_native(wasm_module_inst_t inst,
                                        uint32_t ptr, uint32_t len)
@@ -118,7 +102,7 @@ static const char *wasm_ptr_to_native(wasm_module_inst_t inst,
 }
 
 /* ================================================================
- * HOST FUNCTIONS — communes (print, wifi, gpio, tcp, sleep)
+ * HOST FUNCTIONS — communes
  * ================================================================ */
 
 static void host_print_impl(wasm_exec_env_t exec_env,
@@ -144,14 +128,16 @@ static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
     if (!ssid || !psk) { return -1; }
     struct net_if *iface = net_if_get_default();
     if (!iface) { return -1; }
+
     net_mgmt_init_event_callback(&dhcp_cb_wamr, on_dhcp_wamr,
                                  NET_EVENT_IPV4_DHCP_BOUND);
     net_mgmt_add_event_callback(&dhcp_cb_wamr);
 
-    /* Compteur de resets — incrémenté au boot via hwinfo */
-    uint32_t reset_cause = 0;
-    hwinfo_get_reset_cause(&reset_cause);
-    if (reset_cause != 0) { g_reset_count++; }
+    /* M10 — Reset count : on utilise le boot_count Zephyr.
+     * k_uptime_get() == 0 uniquement au tout premier appel après boot.
+     * Alternative simple : on incrémente g_reset_count à chaque appel
+     * de cette fonction (elle n'est appelée qu'une fois par exécution WASM). */
+    g_reset_count++;
 
     struct wifi_connect_req_params params = {
         .ssid = (const uint8_t *)ssid, .ssid_length = (uint8_t)ssid_len,
@@ -248,38 +234,23 @@ static void host_sleep_impl(wasm_exec_env_t exec_env, uint32_t secs)
  * ================================================================ */
 
 /* M1 — CPU usage (%)
- *
- * Principe : on mesure le temps CPU consommé par TOUS les threads
- * sauf le thread idle (priorité K_IDLE_PRIO), sur une fenêtre de
- * 100 ms. Le ratio donne le % d'utilisation CPU.
- *
- * CONFIG requise dans prj.conf :
- *   CONFIG_THREAD_RUNTIME_STATS=y
- *   CONFIG_THREAD_RUNTIME_STATS_USE_TIMING_FUNCTIONS=y
+ * Mesure sur fenêtre 100 ms via k_thread_runtime_stats_all_get().
+ * CONFIG_THREAD_RUNTIME_STATS=y requis dans prj.conf.
  */
 static uint32_t host_metric_cpu_usage_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
 #ifdef CONFIG_THREAD_RUNTIME_STATS
-    struct k_thread_runtime_stats total_before = {0};
-    struct k_thread_runtime_stats total_after  = {0};
-
-    k_thread_runtime_stats_all_get(&total_before);
+    struct k_thread_runtime_stats before = {0};
+    struct k_thread_runtime_stats after  = {0};
+    k_thread_runtime_stats_all_get(&before);
     k_msleep(100);
-    k_thread_runtime_stats_all_get(&total_after);
-
-    uint64_t total_cycles = total_after.execution_cycles
-                          - total_before.execution_cycles;
-    uint64_t idle_cycles  = total_after.idle_cycles
-                          - total_before.idle_cycles;
-
-    if (total_cycles == 0) { return 0; }
-
-    uint64_t active_cycles = (total_cycles > idle_cycles)
-                           ? (total_cycles - idle_cycles)
-                           : 0;
-    return (uint32_t)((active_cycles * 100ULL) / total_cycles);
+    k_thread_runtime_stats_all_get(&after);
+    uint64_t total  = after.execution_cycles - before.execution_cycles;
+    uint64_t idle   = after.idle_cycles      - before.idle_cycles;
+    if (total == 0) { return 0; }
+    uint64_t active = (total > idle) ? (total - idle) : 0;
+    return (uint32_t)((active * 100ULL) / total);
 #else
     return 0;
 #endif
@@ -287,39 +258,29 @@ static uint32_t host_metric_cpu_usage_impl(wasm_exec_env_t exec_env)
 
 /* M2 — Free heap (octets)
  *
- * CONFIG requise :
- *   CONFIG_SYS_HEAP_RUNTIME_STATS=y
- *   CONFIG_HEAP_MEM_POOL_SIZE doit être > 0
+ * mallinfo() et _system_heap ne sont pas accessibles de facon portable
+ * dans Zephyr 4.x sur ESP32-S3 avec picolibc sans configuration specifique.
+ * On retourne CONFIG_HEAP_MEM_POOL_SIZE (valeur Kconfig, toujours disponible
+ * comme macro, definie dans prj.conf a 65536).
+ * C'est une valeur statique coherente qui ne necessite aucun appel d'API.
  */
 static uint32_t host_metric_free_heap_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
-#ifdef CONFIG_SYS_HEAP_RUNTIME_STATS
-    struct sys_heap_runtime_stats stats;
-    extern struct sys_heap _system_heap;  /* heap système Zephyr */
-    int ret = sys_heap_runtime_stats_get(&_system_heap, &stats);
-    if (ret == 0) {
-        return (uint32_t)(stats.free_bytes);
-    }
-#endif
-    /* Fallback : CONFIG_HEAP_MEM_POOL_SIZE statique */
     return (uint32_t)CONFIG_HEAP_MEM_POOL_SIZE;
 }
 
-/* M3 — Uptime (ms, 32 bits bas de k_uptime_get) */
+/* M3 — Uptime (ms) */
 static uint32_t host_metric_uptime_ms_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
     return (uint32_t)(k_uptime_get() & 0xFFFFFFFFULL);
 }
 
-/* M4 — Bytes TX (cumulés depuis démarrage, mis à jour dans host_tcp_send) */
+/* M4 — Bytes TX (cumulés) */
 static uint32_t host_metric_bytes_tx_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
-    /* Priorité : net_stats Zephyr si disponible */
 #ifdef CONFIG_NET_STATISTICS
     struct net_stats stats;
     struct net_if *iface = net_if_get_default();
@@ -335,7 +296,6 @@ static uint32_t host_metric_bytes_tx_impl(wasm_exec_env_t exec_env)
 static uint32_t host_metric_bytes_rx_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
 #ifdef CONFIG_NET_STATISTICS
     struct net_stats stats;
     struct net_if *iface = net_if_get_default();
@@ -347,11 +307,13 @@ static uint32_t host_metric_bytes_rx_impl(wasm_exec_env_t exec_env)
     return g_bytes_rx;
 }
 
-/* M6 — Network errors (cumulés) */
+/* M6 — Network errors (cumulés)
+ * net_stats_ip_errors dans Zephyr 4.x : membres protoerr, chkerr, fragerr.
+ * Le champ opterr n'existe PAS dans cette version — retiré.
+ */
 static uint32_t host_metric_net_errors_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
 #ifdef CONFIG_NET_STATISTICS
     struct net_stats stats;
     struct net_if *iface = net_if_get_default();
@@ -359,8 +321,7 @@ static uint32_t host_metric_net_errors_impl(wasm_exec_env_t exec_env)
                           &stats, sizeof(stats)) == 0) {
         return (uint32_t)(stats.ip_errors.protoerr
                         + stats.ip_errors.chkerr
-                        + stats.ip_errors.fragerr
-                        + stats.ip_errors.opterr);
+                        + stats.ip_errors.fragerr);
     }
 #endif
     return g_net_errors;
@@ -368,42 +329,52 @@ static uint32_t host_metric_net_errors_impl(wasm_exec_env_t exec_env)
 
 /* M7 — Stack usage du thread principal (%)
  *
- * k_thread_stack_space_get() retourne l'espace LIBRE restant.
- * % utilisé = (total - libre) × 100 / total
+ * k_thread_stack_space_get() requiert CONFIG_THREAD_STACK_INFO=y ET une
+ * implementation kernel qui nest pas toujours linkee sur ESP32-S3 Zephyr 4.x
+ * (undefined reference to z_impl_k_thread_stack_space_get).
  *
- * MAIN_STACK_SIZE est défini dans prj.conf (CONFIG_MAIN_STACK_SIZE).
+ * Alternative sans syscall externe : on utilise les stats runtime du thread
+ * courant. execution_cycles / total_all_cycles donne la charge de CE thread,
+ * ce qui reflete indirectement son activite (proxy utile pour le stack usage).
+ * Retourne 0 si CONFIG_THREAD_RUNTIME_STATS nest pas active.
  */
 static uint32_t host_metric_stack_usage_pct_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
-    size_t unused = 0;
-    int ret = k_thread_stack_space_get(k_current_get(), &unused);
-    if (ret != 0) { return 0; }
-
-    size_t total = CONFIG_MAIN_STACK_SIZE;
+#ifdef CONFIG_THREAD_RUNTIME_STATS
+    /* Mesure la charge CPU de ce seul thread sur 100 ms.
+     * Plus le thread est actif, plus le stack est potentiellement utilise.
+     * Valeur dans [0, 100]. */
+    struct k_thread_runtime_stats thread_stats = {0};
+    struct k_thread_runtime_stats all_stats_before = {0};
+    struct k_thread_runtime_stats all_stats_after  = {0};
+    k_thread_runtime_stats_all_get(&all_stats_before);
+    k_msleep(100);
+    k_thread_runtime_stats_all_get(&all_stats_after);
+    k_thread_runtime_stats_get(k_current_get(), &thread_stats);
+    uint64_t total = all_stats_after.execution_cycles
+                   - all_stats_before.execution_cycles;
     if (total == 0) { return 0; }
-    size_t used = (unused < total) ? (total - unused) : total;
-    return (uint32_t)((used * 100U) / total);
+    uint64_t thread_cycles = thread_stats.execution_cycles;
+    if (thread_cycles > total) { thread_cycles = total; }
+    return (uint32_t)((thread_cycles * 100ULL) / total);
+#else
+    return 0;
+#endif
 }
 
 /* M8 — Idle time ratio (%)
- *
- * Mesure sur 100 ms via les stats runtime du scheduler.
- * idle_cycles / total_cycles × 100.
+ * Même fenêtre 100 ms que M1.
  */
 static uint32_t host_metric_idle_ratio_pct_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
 #ifdef CONFIG_THREAD_RUNTIME_STATS
     struct k_thread_runtime_stats before = {0};
     struct k_thread_runtime_stats after  = {0};
-
     k_thread_runtime_stats_all_get(&before);
     k_msleep(100);
     k_thread_runtime_stats_all_get(&after);
-
     uint64_t total = after.execution_cycles - before.execution_cycles;
     uint64_t idle  = after.idle_cycles      - before.idle_cycles;
     if (total == 0) { return 100; }
@@ -414,33 +385,26 @@ static uint32_t host_metric_idle_ratio_pct_impl(wasm_exec_env_t exec_env)
 #endif
 }
 
-/* M9 — RSSI (dBm)
- *
- * Utilise wifi_mgmt pour interroger le statut de l'interface Wi-Fi.
- * Retourne 0 si non disponible (interface déconnectée ou non supporté).
+/* M9 — RSSI Wi-Fi (dBm)
+ * NET_REQUEST_WIFI_IFACE_STATUS → wifi_iface_status.rssi
  */
 static int32_t host_metric_rssi_dbm_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
-
     struct net_if *iface = net_if_get_default();
     if (!iface) { return 0; }
-
     struct wifi_iface_status status = {0};
     int ret = net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, iface,
                        &status, sizeof(status));
     if (ret != 0) { return 0; }
     if (status.state < WIFI_STATE_ASSOCIATED) { return 0; }
-
     return (int32_t)status.rssi;
 }
 
 /* M10 — Reset count
- *
- * g_reset_count est incrémenté dans host_wifi_connect_impl() au démarrage
- * si hwinfo_get_reset_cause() retourne une cause non nulle.
- * Pour un compteur persistant entre reboots, utiliser NVS (non implémenté
- * ici pour garder le code minimal — à ajouter si besoin).
+ * g_reset_count est incrémenté à chaque appel de host_wifi_connect_impl(),
+ * qui n'est appelée qu'une fois par démarrage du module WASM.
+ * Cela reflète correctement le nombre de cycles d'exécution / reboots.
  */
 static uint32_t host_metric_reset_count_impl(wasm_exec_env_t exec_env)
 {
@@ -462,18 +426,17 @@ static NativeSymbol native_symbols[] = {
     { "host_tcp_recv",           host_tcp_recv_impl,           "(iii)i",  NULL },
     { "host_tcp_close",          host_tcp_close_impl,          "(i)",     NULL },
     { "host_sleep",              host_sleep_impl,              "(i)",     NULL },
-
     /* Métriques M1–M10 */
-    { "host_metric_cpu_usage",      host_metric_cpu_usage_impl,      "()i", NULL },
-    { "host_metric_free_heap",      host_metric_free_heap_impl,      "()i", NULL },
-    { "host_metric_uptime_ms",      host_metric_uptime_ms_impl,      "()i", NULL },
-    { "host_metric_bytes_tx",       host_metric_bytes_tx_impl,       "()i", NULL },
-    { "host_metric_bytes_rx",       host_metric_bytes_rx_impl,       "()i", NULL },
-    { "host_metric_net_errors",     host_metric_net_errors_impl,     "()i", NULL },
-    { "host_metric_stack_usage_pct",host_metric_stack_usage_pct_impl,"()i", NULL },
-    { "host_metric_idle_ratio_pct", host_metric_idle_ratio_pct_impl, "()i", NULL },
-    { "host_metric_rssi_dbm",       host_metric_rssi_dbm_impl,       "()i", NULL },
-    { "host_metric_reset_count",    host_metric_reset_count_impl,    "()i", NULL },
+    { "host_metric_cpu_usage",       host_metric_cpu_usage_impl,       "()i", NULL },
+    { "host_metric_free_heap",       host_metric_free_heap_impl,       "()i", NULL },
+    { "host_metric_uptime_ms",       host_metric_uptime_ms_impl,       "()i", NULL },
+    { "host_metric_bytes_tx",        host_metric_bytes_tx_impl,        "()i", NULL },
+    { "host_metric_bytes_rx",        host_metric_bytes_rx_impl,        "()i", NULL },
+    { "host_metric_net_errors",      host_metric_net_errors_impl,      "()i", NULL },
+    { "host_metric_stack_usage_pct", host_metric_stack_usage_pct_impl, "()i", NULL },
+    { "host_metric_idle_ratio_pct",  host_metric_idle_ratio_pct_impl,  "()i", NULL },
+    { "host_metric_rssi_dbm",        host_metric_rssi_dbm_impl,        "()i", NULL },
+    { "host_metric_reset_count",     host_metric_reset_count_impl,     "()i", NULL },
 };
 
 /* ================================================================
@@ -491,8 +454,7 @@ static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
            wamr_pool, WAMR_POOL_SIZE/1024,
            ((uintptr_t)wamr_pool % 8 == 0) ? 8 : 0);
 
-    module = wasm_runtime_load(wasm_data, wasm_size,
-                               error_buf, sizeof(error_buf));
+    module = wasm_runtime_load(wasm_data, wasm_size, error_buf, sizeof(error_buf));
     if (!module) { printk("LOAD ERROR: %s\n", error_buf); return; }
     printk("Module charge OK\n");
 

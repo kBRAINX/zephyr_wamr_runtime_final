@@ -28,7 +28,7 @@ zephyrproject/
 └── wasm-micro-runtime/
 
 # Acceder au repertoire du projet
-cd zephyr_wamr_runtime
+cd zephyr_wamr_runtime_final
 
 # Compiler pour l'equipement IoT (heltec_wifi_lora32_v3/esp32s3/procpu est le support de notre equipement iot sur zephyr)
 west build -p always -b heltec_wifi_lora32_v3/esp32s3/procpu .
