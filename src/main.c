@@ -29,15 +29,24 @@ static const struct gpio_dt_spec board_led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
 #endif
 
 /* ----------------------------------------------------------------
- * WAMR
+ * WAMR — UNE SEULE instance WASM (metrics_wasm)
+ *
+ * Deux instances WASM à 64 KB de mémoire linéaire (plancher du
+ * toolchain) = ~180 KB : ne tient NI en DRAM (121 KB libres) NI de
+ * façon fiable en IRAM. Le générateur de charge (Pi) est donc un
+ * thread NATIF, qui ne consomme aucune mémoire linéaire WASM.
+ * Le pool ne sert qu'à metrics_wasm -> ~112 KB, qui tient en DRAM.
  * ---------------------------------------------------------------- */
 #define WASM_MAX_SIZE  (40  * 1024)
 #define STACK_SIZE     (8   * 1024)
-#define HEAP_SIZE      (16  * 1024)
+#define HEAP_SIZE      (8   * 1024)
 #define WAMR_POOL_SIZE (160 * 1024)
 
-static uint8_t wasm_buffer[WASM_MAX_SIZE];
+/* Pool en DRAM (pas d'attribut de section IRAM) : évite la fragilité
+ * du heap WAMR en IRAM qui provoquait le blocage dans full_init(). */
 static char wamr_pool[WAMR_POOL_SIZE] __aligned(8);
+
+static uint8_t  wasm_buffer[WASM_MAX_SIZE];
 
 /* ----------------------------------------------------------------
  * RÉSEAU / UART
@@ -73,10 +82,6 @@ static void uart_drain_rx(const struct device *dev)
 
 /* ----------------------------------------------------------------
  * ÉTAT PARTAGÉ — métriques réseau cumulées
- * g_bytes_tx/rx/errors : mis à jour dans host_tcp_send/recv
- * g_reset_count        : incrémenté au premier appel wifi_connect
- *                        détecté via le compteur de boot Zephyr
- *                        (sans hwinfo, non disponible sur toutes cibles)
  * ---------------------------------------------------------------- */
 static uint32_t g_bytes_tx    = 0;
 static uint32_t g_bytes_rx    = 0;
@@ -84,7 +89,7 @@ static uint32_t g_net_errors  = 0;
 static uint32_t g_reset_count = 0;
 
 /* ----------------------------------------------------------------
- * RÉSOLUTION DE POINTEUR WASM → natif
+ * RÉSOLUTION DE POINTEUR WASM -> natif
  * ---------------------------------------------------------------- */
 static const char *wasm_ptr_to_native(wasm_module_inst_t inst,
                                        uint32_t ptr, uint32_t len)
@@ -133,10 +138,6 @@ static int32_t host_wifi_connect_impl(wasm_exec_env_t exec_env,
                                  NET_EVENT_IPV4_DHCP_BOUND);
     net_mgmt_add_event_callback(&dhcp_cb_wamr);
 
-    /* M10 — Reset count : on utilise le boot_count Zephyr.
-     * k_uptime_get() == 0 uniquement au tout premier appel après boot.
-     * Alternative simple : on incrémente g_reset_count à chaque appel
-     * de cette fonction (elle n'est appelée qu'une fois par exécution WASM). */
     g_reset_count++;
 
     struct wifi_connect_req_params params = {
@@ -230,13 +231,9 @@ static void host_sleep_impl(wasm_exec_env_t exec_env, uint32_t secs)
 }
 
 /* ================================================================
- * HOST FUNCTIONS — MÉTRIQUES (M1–M10)
+ * HOST FUNCTIONS — MÉTRIQUES (M1–M10, inchangées)
  * ================================================================ */
 
-/* M1 — CPU usage (%)
- * Mesure sur fenêtre 100 ms via k_thread_runtime_stats_all_get().
- * CONFIG_THREAD_RUNTIME_STATS=y requis dans prj.conf.
- */
 static uint32_t host_metric_cpu_usage_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -256,28 +253,18 @@ static uint32_t host_metric_cpu_usage_impl(wasm_exec_env_t exec_env)
 #endif
 }
 
-/* M2 — Free heap (octets)
- *
- * mallinfo() et _system_heap ne sont pas accessibles de facon portable
- * dans Zephyr 4.x sur ESP32-S3 avec picolibc sans configuration specifique.
- * On retourne CONFIG_HEAP_MEM_POOL_SIZE (valeur Kconfig, toujours disponible
- * comme macro, definie dans prj.conf a 65536).
- * C'est une valeur statique coherente qui ne necessite aucun appel d'API.
- */
 static uint32_t host_metric_free_heap_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
     return (uint32_t)CONFIG_HEAP_MEM_POOL_SIZE;
 }
 
-/* M3 — Uptime (ms) */
 static uint32_t host_metric_uptime_ms_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
     return (uint32_t)(k_uptime_get() & 0xFFFFFFFFULL);
 }
 
-/* M4 — Bytes TX (cumulés) */
 static uint32_t host_metric_bytes_tx_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -292,7 +279,6 @@ static uint32_t host_metric_bytes_tx_impl(wasm_exec_env_t exec_env)
     return g_bytes_tx;
 }
 
-/* M5 — Bytes RX (cumulés) */
 static uint32_t host_metric_bytes_rx_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -307,10 +293,6 @@ static uint32_t host_metric_bytes_rx_impl(wasm_exec_env_t exec_env)
     return g_bytes_rx;
 }
 
-/* M6 — Network errors (cumulés)
- * net_stats_ip_errors dans Zephyr 4.x : membres protoerr, chkerr, fragerr.
- * Le champ opterr n'existe PAS dans cette version — retiré.
- */
 static uint32_t host_metric_net_errors_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -327,24 +309,10 @@ static uint32_t host_metric_net_errors_impl(wasm_exec_env_t exec_env)
     return g_net_errors;
 }
 
-/* M7 — Stack usage du thread principal (%)
- *
- * k_thread_stack_space_get() requiert CONFIG_THREAD_STACK_INFO=y ET une
- * implementation kernel qui nest pas toujours linkee sur ESP32-S3 Zephyr 4.x
- * (undefined reference to z_impl_k_thread_stack_space_get).
- *
- * Alternative sans syscall externe : on utilise les stats runtime du thread
- * courant. execution_cycles / total_all_cycles donne la charge de CE thread,
- * ce qui reflete indirectement son activite (proxy utile pour le stack usage).
- * Retourne 0 si CONFIG_THREAD_RUNTIME_STATS nest pas active.
- */
 static uint32_t host_metric_stack_usage_pct_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
 #ifdef CONFIG_THREAD_RUNTIME_STATS
-    /* Mesure la charge CPU de ce seul thread sur 100 ms.
-     * Plus le thread est actif, plus le stack est potentiellement utilise.
-     * Valeur dans [0, 100]. */
     struct k_thread_runtime_stats thread_stats = {0};
     struct k_thread_runtime_stats all_stats_before = {0};
     struct k_thread_runtime_stats all_stats_after  = {0};
@@ -363,9 +331,6 @@ static uint32_t host_metric_stack_usage_pct_impl(wasm_exec_env_t exec_env)
 #endif
 }
 
-/* M8 — Idle time ratio (%)
- * Même fenêtre 100 ms que M1.
- */
 static uint32_t host_metric_idle_ratio_pct_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -385,9 +350,6 @@ static uint32_t host_metric_idle_ratio_pct_impl(wasm_exec_env_t exec_env)
 #endif
 }
 
-/* M9 — RSSI Wi-Fi (dBm)
- * NET_REQUEST_WIFI_IFACE_STATUS → wifi_iface_status.rssi
- */
 static int32_t host_metric_rssi_dbm_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -401,11 +363,6 @@ static int32_t host_metric_rssi_dbm_impl(wasm_exec_env_t exec_env)
     return (int32_t)status.rssi;
 }
 
-/* M10 — Reset count
- * g_reset_count est incrémenté à chaque appel de host_wifi_connect_impl(),
- * qui n'est appelée qu'une fois par démarrage du module WASM.
- * Cela reflète correctement le nombre de cycles d'exécution / reboots.
- */
 static uint32_t host_metric_reset_count_impl(wasm_exec_env_t exec_env)
 {
     ARG_UNUSED(exec_env);
@@ -416,7 +373,6 @@ static uint32_t host_metric_reset_count_impl(wasm_exec_env_t exec_env)
  * TABLE DES SYMBOLES NATIFS
  * ================================================================ */
 static NativeSymbol native_symbols[] = {
-    /* Communes */
     { "host_print",              host_print_impl,              "(*~)",    NULL },
     { "host_wifi_connect",       host_wifi_connect_impl,       "(iiii)i", NULL },
     { "host_wait_network_ready", host_wait_network_ready_impl, "(i)i",    NULL },
@@ -426,7 +382,6 @@ static NativeSymbol native_symbols[] = {
     { "host_tcp_recv",           host_tcp_recv_impl,           "(iii)i",  NULL },
     { "host_tcp_close",          host_tcp_close_impl,          "(i)",     NULL },
     { "host_sleep",              host_sleep_impl,              "(i)",     NULL },
-    /* Métriques M1–M10 */
     { "host_metric_cpu_usage",       host_metric_cpu_usage_impl,       "()i", NULL },
     { "host_metric_free_heap",       host_metric_free_heap_impl,       "()i", NULL },
     { "host_metric_uptime_ms",       host_metric_uptime_ms_impl,       "()i", NULL },
@@ -440,7 +395,56 @@ static NativeSymbol native_symbols[] = {
 };
 
 /* ================================================================
- * EXÉCUTION DU MODULE WASM
+ * GÉNÉRATEUR DE CHARGE — thread NATIF (série de Nilakantha)
+ *
+ * Tourne en concurrence avec metrics_wasm sur le cœur unique.
+ * Priorité PLUS BASSE que le thread principal : quand metrics dort
+ * (host_sleep / k_msleep), ce thread prend le CPU -> charge visible.
+ * Quand metrics se réveille pour échantillonner, il préempte ce thread.
+ * Aucune mémoire linéaire WASM consommée (c'est du C natif pur).
+ * ================================================================ */
+#define PI_THREAD_STACK_SIZE 4096
+#define PI_THREAD_PRIORITY   7      /* > numéro = priorité plus basse que main (0) */
+#define PI_PAUSE_S           10
+#define PI_BATCH_ITER        20000  /* itérations entre deux lectures d'horloge */
+
+static const uint32_t pi_durations_s[] = { 5, 8, 10, 15 };
+static volatile double g_pi_result;  /* volatile : empêche l'élimination du calcul */
+
+K_THREAD_STACK_DEFINE(pi_stack, PI_THREAD_STACK_SIZE);
+static struct k_thread pi_thread_data;
+
+static void pi_load_thread(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+    size_t idx = 0;
+
+    while (1) {
+        uint32_t dur_s = pi_durations_s[idx % ARRAY_SIZE(pi_durations_s)];
+        printk("[PI_LOAD] debut charge, duree=%us\n", dur_s);
+
+        int64_t start = k_uptime_get();
+        double pi = 3.0, sign = 1.0, a = 2.0;
+
+        while ((k_uptime_get() - start) < (int64_t)dur_s * 1000) {
+            for (int i = 0; i < PI_BATCH_ITER; i++) {
+                double denom = a * (a + 1.0) * (a + 2.0);
+                pi  += sign * 4.0 / denom;
+                sign = -sign;
+                a   += 2.0;
+            }
+        }
+        g_pi_result = pi;
+        printk("[PI_LOAD] fin de charge (pi~=%d.%06d), pause=%us\n",
+               (int)pi, (int)((pi - (int)pi) * 1000000.0), PI_PAUSE_S);
+
+        k_sleep(K_SECONDS(PI_PAUSE_S));
+        idx++;
+    }
+}
+
+/* ================================================================
+ * EXÉCUTION DU MODULE WASM (metrics)
  * ================================================================ */
 static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
 {
@@ -449,10 +453,6 @@ static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
     wasm_module_inst_t   module_inst = NULL;
     wasm_exec_env_t      exec_env    = NULL;
     wasm_function_inst_t func        = NULL;
-
-    printk("[POOL] addr=%p size=%d KB align=%d\n",
-           wamr_pool, WAMR_POOL_SIZE/1024,
-           ((uintptr_t)wamr_pool % 8 == 0) ? 8 : 0);
 
     module = wasm_runtime_load(wasm_data, wasm_size, error_buf, sizeof(error_buf));
     if (!module) { printk("LOAD ERROR: %s\n", error_buf); return; }
@@ -472,10 +472,7 @@ static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
     func = wasm_runtime_lookup_function(module_inst, "_start");
     if (!func) func = wasm_runtime_lookup_function(module_inst, "main");
     if (!func) func = wasm_runtime_lookup_function(module_inst, "__main_void");
-    if (!func) {
-        printk("point entree introuvable (_start/main)\n");
-        goto cleanup_env;
-    }
+    if (!func) { printk("point entree introuvable\n"); goto cleanup_env; }
     printk("Point entree trouve\n");
     printk("Executing WASM...\n");
 
@@ -501,8 +498,8 @@ int main(void)
     }
 #endif
 
-    printk("[POOL] wamr_pool=%p aligned8=%d\n",
-           wamr_pool, (uintptr_t)wamr_pool % 8 == 0 ? 1 : 0);
+    printk("[POOL] wamr_pool=%p size=%dKB (DRAM)\n",
+           wamr_pool, WAMR_POOL_SIZE/1024);
 
     RuntimeInitArgs init_args;
     memset(&init_args, 0, sizeof(init_args));
@@ -525,7 +522,15 @@ int main(void)
     uart_dev = DEVICE_DT_GET(UART_NODE);
     if (!device_is_ready(uart_dev)) { printk("UART not ready\n"); return -1; }
 
-    printk("\n===== WAMR UART DEPLOYMENT — Metrics Edition =====\n");
+    /* Démarre le générateur de charge natif AVANT la boucle UART.
+     * Il tourne en tâche de fond, en concurrence avec metrics_wasm. */
+    k_thread_create(&pi_thread_data, pi_stack, PI_THREAD_STACK_SIZE,
+                     pi_load_thread, NULL, NULL, NULL,
+                     PI_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&pi_thread_data, "pi_load");
+    printk("Generateur de charge Pi (natif) demarre\n");
+
+    printk("\n===== WAMR UART DEPLOYMENT — Metrics + Native Load =====\n");
     printk("Protocol : 4 bytes size (LE) + wasm binary\n");
     printk("Max size : %d bytes\n", WASM_MAX_SIZE);
 
@@ -551,7 +556,6 @@ int main(void)
         }
         printk("Upload complete (%u bytes)\n", wasm_size);
 
-        /* Reset des compteurs avant nouvelle exécution */
         g_bytes_tx   = 0;
         g_bytes_rx   = 0;
         g_net_errors = 0;
