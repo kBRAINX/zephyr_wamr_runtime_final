@@ -1,0 +1,29 @@
+/*
+ * optional-overlays/esp32c6-usb-console.overlay
+ *
+ * OPTIONNEL, opt-in explicite. Redirige la console de Zephyr vers le
+ * controleur USB Serial/JTAG de l'ESP32-C6, pour que TOUT (ROM, amorceur,
+ * Zephyr, application) sorte sur le port USB natif (/dev/ttyACM0).
+ *
+ * A n'utiliser QUE si vous ne branchez qu'un cable sur le port "USB" de la
+ * carte. Voir docs/ESP32C6_PORTS.md.
+ *
+ * Activation :
+ *   west build ... -- -DEXTRA_DTC_OVERLAY_FILE=optional-overlays/esp32c6-usb-console.overlay
+ *
+ * Reserve : le FIFO du controleur USB Serial/JTAG (~64 octets) et l'absence
+ * de controle de flux rendent l'upload d'un .wasm de plusieurs dizaines de
+ * Ko moins fiable qu'avec le port UART physique. Parfait pour lire les logs,
+ * a eviter pour les gros transferts.
+ */
+
+&usb_serial_jtag {
+    status = "okay";
+};
+
+/ {
+    chosen {
+        zephyr,console = &usb_serial_jtag;
+        zephyr,shell-uart = &usb_serial_jtag;
+    };
+};

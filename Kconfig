@@ -1,0 +1,44 @@
+# Kconfig — options specifiques a l'application WAMR multi-transport
+#
+# Declare les symboles personnalises utilises dans prj.conf et les overlays
+# de configuration. Sans ce fichier, Zephyr rejette CONFIG_WAMR_* comme
+# "unknown symbol".
+
+mainmenu "WAMR multi-transport metrics runtime"
+
+config WAMR_NODE_DEVICE_NAME
+	string "Nom unique de l'equipement (expose au module WASM)"
+	default "zephyr_node"
+	help
+	  Identifiant du noeud, transmis au module WASM a l'execution via la
+	  host function host_get_device_name. Jamais code en dur dans le .wasm.
+
+config WAMR_NODE_DEVICE_TYPE
+	string "Type / famille de l'equipement"
+	default "generic"
+	help
+	  Categorie materielle informative (ex. esp32s3, esp32c6, stm32wb55).
+	  Exposee via host_get_device_type.
+
+config WAMR_NODE_OS_NAME
+	string "Nom de l'OS hote"
+	default "zephyr"
+	help
+	  Expose via host_get_os_name.
+
+config WAMR_WIFI_SSID
+	string "SSID du point d'acces Wi-Fi"
+	default "a26nguep-hotspot"
+	depends on WIFI
+	help
+	  Utilise uniquement par le backend transport Wi-Fi. Sans effet en BLE.
+
+config WAMR_WIFI_PSK
+	string "Mot de passe Wi-Fi (PSK)"
+	default "123456789"
+	depends on WIFI
+	help
+	  Utilise uniquement par le backend transport Wi-Fi. Sans effet en BLE.
+
+# Rattachement a l'arbre Kconfig de Zephyr (obligatoire).
+source "Kconfig.zephyr"
