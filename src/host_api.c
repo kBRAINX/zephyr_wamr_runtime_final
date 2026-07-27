@@ -19,6 +19,12 @@
 #include <zephyr/sys/printk.h>
 #include <string.h>
 
+#if defined(CONFIG_WIFI) && defined(CONFIG_NET_STATISTICS)
+#include <zephyr/net/net_if.h>
+#include <zephyr/net/net_stats.h>
+#include <zephyr/net/net_mgmt.h>
+#endif
+
 #include "wasm_export.h"
 #include "host_api.h"
 #include "transport.h"
@@ -249,6 +255,52 @@ static uint32_t h_reset_count(wasm_exec_env_t e)
 	return g_reset_count;
 }
 
+/* M11 — active threads : nombre de threads noyau.
+ * Parcourt la liste des threads si CONFIG_THREAD_MONITOR est actif ; sinon
+ * retourne 1 (au moins le thread courant). Detection de fuite de threads.
+ */
+#ifdef CONFIG_THREAD_MONITOR
+static void count_thread_cb(const struct k_thread *thread, void *user_data)
+{
+	ARG_UNUSED(thread);
+	uint32_t *n = (uint32_t *)user_data;
+	(*n)++;
+}
+#endif
+
+static uint32_t h_active_threads(wasm_exec_env_t e)
+{
+	ARG_UNUSED(e);
+#ifdef CONFIG_THREAD_MONITOR
+	uint32_t n = 0;
+	k_thread_foreach(count_thread_cb, &n);
+	return n;
+#else
+	return 1;
+#endif
+}
+
+/* M12 — retransmissions TCP.
+ * Exposees par les statistiques reseau si CONFIG_NET_STATISTICS et
+ * CONFIG_NET_STATISTICS_TCP sont actifs. 0 sinon (et 0 en BLE : pas de TCP).
+ */
+static uint32_t h_tcp_retransmissions(wasm_exec_env_t e)
+{
+	ARG_UNUSED(e);
+#if defined(CONFIG_NET_STATISTICS) && defined(CONFIG_NET_STATISTICS_TCP) && defined(CONFIG_WIFI)
+	struct net_stats stats;
+	struct net_if *iface = net_if_get_default();
+	if (iface && net_mgmt(NET_REQUEST_STATS_GET_ALL, iface,
+			      &stats, sizeof(stats)) == 0) {
+		/* Dans struct net_stats_tcp (Zephyr), le compteur de segments
+		 * retransmis se nomme "rexmit" (affiche "re-xmit" par le shell),
+		 * pas "retransmit". */
+		return (uint32_t)stats.tcp.rexmit;
+	}
+#endif
+	return 0;
+}
+
 /* ================================================================
  * HOST FUNCTIONS — identite (resolue a l'execution)
  * ================================================================ */
@@ -310,6 +362,8 @@ static NativeSymbol native_symbols[] = {
 	{ "host_metric_stack_usage_pct",   h_stack_usage_pct,   "()i", NULL },
 	{ "host_metric_signal_dbm",        h_signal_dbm,        "()i", NULL },
 	{ "host_metric_reset_count",       h_reset_count,       "()i", NULL },
+	{ "host_metric_active_threads",       h_active_threads,       "()i", NULL },
+	{ "host_metric_tcp_retransmissions",  h_tcp_retransmissions,  "()i", NULL },
 
 	{ "host_get_device_name",       h_get_device_name,       "(*~)i", NULL },
 	{ "host_get_device_type",       h_get_device_type,       "(*~)i", NULL },

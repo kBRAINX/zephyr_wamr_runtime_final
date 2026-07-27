@@ -161,13 +161,28 @@ int transport_send(int handle, const uint8_t *buf, uint32_t len)
 	if (fd < 0) {
 		return -1;
 	}
-	int sent = zsock_send(fd, buf, len, 0);
-	if (sent > 0) {
-		g_tx_counters.bytes_tx += (uint32_t)sent;
-	} else {
-		g_tx_counters.errors++;
+
+	/* IMPORTANT : zsock_send() peut faire un envoi PARTIEL (renvoyer moins
+	 * que 'len'), surtout pour des charges utiles de plusieurs centaines
+	 * d'octets. Si on n'envoie pas la totalite, la requete HTTP arrive
+	 * tronquee cote serveur, qui attend alors le reste du corps annonce par
+	 * Content-Length et finit par timeouter. On boucle donc jusqu'a avoir
+	 * tout emis.
+	 */
+	uint32_t total_sent = 0;
+	while (total_sent < len) {
+		int n = zsock_send(fd, buf + total_sent, len - total_sent, 0);
+		if (n <= 0) {
+			g_tx_counters.errors++;
+			/* Socket casse : on le ferme pour repartir proprement. */
+			zsock_close(g_fd);
+			g_fd = -1;
+			return (total_sent > 0) ? (int)total_sent : -1;
+		}
+		total_sent += (uint32_t)n;
 	}
-	return sent;
+	g_tx_counters.bytes_tx += total_sent;
+	return (int)total_sent;
 }
 
 int transport_recv(int handle, uint8_t *buf, uint32_t len)
