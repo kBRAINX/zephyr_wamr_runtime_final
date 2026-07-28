@@ -26,6 +26,31 @@ config WAMR_NODE_OS_NAME
 	help
 	  Expose via host_get_os_name.
 
+# --- Tailles memoire WAMR, ajustables par carte ---
+# Permettent d'adapter l'empreinte a chaque equipement. Les cartes a large
+# RAM (ESP32-S3, ESP32-C6) gardent les valeurs par defaut ; les cartes
+# contraintes (NUCLEO-WB55RG, ~192 Ko de RAM) les reduisent dans leur
+# fichier boards/<carte>.conf, sinon l'edition de liens deborde.
+
+config WAMR_APP_POOL_SIZE_KB
+	int "Taille du pool memoire WAMR (Ko)"
+	default 160
+	help
+	  Doit contenir la memoire lineaire du module (64 Ko incompressibles)
+	  plus les metadonnees WAMR. Minimum realiste : ~72 Ko.
+
+config WAMR_APP_WASM_MAX_KB
+	int "Taille max du binaire .wasm accepte (Ko)"
+	default 40
+
+config WAMR_APP_STACK_KB
+	int "Taille de pile d'execution WAMR (Ko)"
+	default 8
+
+config WAMR_APP_HEAP_KB
+	int "Taille du tas d'application WAMR (Ko)"
+	default 16
+
 config WAMR_WIFI_SSID
 	string "SSID du point d'acces Wi-Fi"
 	default "a26nguep-hotspot"

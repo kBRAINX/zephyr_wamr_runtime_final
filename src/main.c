@@ -28,10 +28,30 @@
 
 #define UART_NODE DT_CHOSEN(zephyr_console)
 
-#define WASM_MAX_SIZE  (40  * 1024)
-#define STACK_SIZE     (8   * 1024)
-#define HEAP_SIZE      (16  * 1024)
-#define WAMR_POOL_SIZE (160 * 1024)
+/* Tailles WAMR configurables par carte via Kconfig (voir Kconfig du projet).
+ * Cela permet d'adapter l'empreinte memoire a chaque equipement :
+ *  - Heltec/ESP32-S3, ESP32-C6 : beaucoup de RAM -> gros pool (160 Ko) ;
+ *  - NUCLEO-WB55RG : seulement ~192 Ko de RAM applicative, dont une partie
+ *    prise par la pile BLE -> pool reduit, sinon l'edition de liens deborde.
+ * Les valeurs par defaut (si non definies) conviennent aux cartes a large RAM.
+ */
+#ifndef CONFIG_WAMR_APP_POOL_SIZE_KB
+#define CONFIG_WAMR_APP_POOL_SIZE_KB 160
+#endif
+#ifndef CONFIG_WAMR_APP_WASM_MAX_KB
+#define CONFIG_WAMR_APP_WASM_MAX_KB 40
+#endif
+#ifndef CONFIG_WAMR_APP_STACK_KB
+#define CONFIG_WAMR_APP_STACK_KB 8
+#endif
+#ifndef CONFIG_WAMR_APP_HEAP_KB
+#define CONFIG_WAMR_APP_HEAP_KB 16
+#endif
+
+#define WASM_MAX_SIZE  (CONFIG_WAMR_APP_WASM_MAX_KB  * 1024)
+#define STACK_SIZE     (CONFIG_WAMR_APP_STACK_KB     * 1024)
+#define HEAP_SIZE      (CONFIG_WAMR_APP_HEAP_KB      * 1024)
+#define WAMR_POOL_SIZE (CONFIG_WAMR_APP_POOL_SIZE_KB * 1024)
 
 static uint8_t wasm_buffer[WASM_MAX_SIZE];
 static char wamr_pool[WAMR_POOL_SIZE] __aligned(8);

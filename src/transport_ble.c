@@ -67,7 +67,13 @@ static const struct bt_data sd[] = {
 
 static void start_advertising(void)
 {
-	int err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
+	/* BT_LE_ADV_CONN a ete deprecie puis retire dans les Zephyr recents
+	 * (>= 4.4) : c'etait un raccourci pour l'option BT_LE_ADV_OPT_CONNECTABLE,
+	 * elle-meme supprimee. Le remplacement officiel pour un advertising
+	 * connectable est BT_LE_ADV_CONN_FAST_1 (intervalle rapide, recommande
+	 * pour une reconnexion reactive). Voir la doc "Deprecated List" de Zephyr.
+	 */
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
 				  sd, ARRAY_SIZE(sd));
 	if (err) {
 		printk("[ble] echec de demarrage de l'advertising (%d)\n", err);
