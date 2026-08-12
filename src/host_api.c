@@ -218,25 +218,38 @@ static uint32_t h_transport_errors(wasm_exec_env_t e)
 }
 
 /* M7 — Stack usage (%) : proxy via charge du thread courant */
+/* M7 — occupation reelle de la pile du thread courant, en %.
+ *
+ * ATTENTION : l'ancienne version calculait par erreur un ratio de cycles CPU
+ * (via k_thread_runtime_stats), ce qui renvoyait ~100 % en permanence et
+ * declenchait a tort l'alarme "pile pleine". On mesure ici la VRAIE occupation
+ * de pile avec l'API dediee de Zephyr :
+ *   - k_thread_stack_space_get() -> espace INUTILISE (octets restants) ;
+ *   - thread->stack_info.size    -> taille totale de la pile (octets),
+ *     exposee quand CONFIG_THREAD_STACK_INFO est actif.
+ * usage% = (taille - inutilise) * 100 / taille.
+ */
 static uint32_t h_stack_usage_pct(wasm_exec_env_t e)
 {
 	ARG_UNUSED(e);
-#ifdef CONFIG_THREAD_RUNTIME_STATS
-	struct k_thread_runtime_stats t = {0}, a = {0}, b = {0};
-	k_thread_runtime_stats_all_get(&a);
-	k_msleep(100);
-	k_thread_runtime_stats_all_get(&b);
-	k_thread_runtime_stats_get(k_current_get(), &t);
-	uint64_t total = b.execution_cycles - a.execution_cycles;
-	if (total == 0) {
+#if defined(CONFIG_INIT_STACKS) && defined(CONFIG_THREAD_STACK_INFO)
+	struct k_thread *self = k_current_get();
+	size_t unused = 0;
+	if (k_thread_stack_space_get(self, &unused) != 0) {
+		return 0; /* mesure indisponible : on ne declenche pas d'alarme */
+	}
+	/* La taille totale de la pile est exposee par stack_info.size quand
+	 * CONFIG_THREAD_STACK_INFO est actif (il n'existe pas de fonction
+	 * k_thread_stack_size_get() dans cette version de Zephyr). */
+	size_t total = self->stack_info.size;
+	if (total == 0 || unused > total) {
 		return 0;
 	}
-	uint64_t tc = t.execution_cycles;
-	if (tc > total) {
-		tc = total;
-	}
-	return (uint32_t)((tc * 100ULL) / total);
+	size_t used = total - unused;
+	return (uint32_t)((used * 100U) / total);
 #else
+	/* Sans INIT_STACKS + THREAD_STACK_INFO, l'occupation n'est pas mesurable
+	 * de facon fiable. On renvoie 0 (aucune alarme parasite). */
 	return 0;
 #endif
 }
