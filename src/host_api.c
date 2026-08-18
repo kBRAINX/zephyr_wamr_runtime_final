@@ -1,17 +1,6 @@
 /*
  * src/host_api.c — Couche hote WAMR (transport abstrait + metriques + identite)
  *
- * Cette couche fait le pont entre le module WASM et le firmware natif. Elle
- * n'expose au WASM que des host functions GENERIQUES :
- *   - transport abstrait (host_transport_*) branche sur transport.h, donc
- *     sur le backend Wi-Fi OU BLE compile, sans que le WASM le sache ;
- *   - metriques BRUTES uniquement (aucun calcul derive ici : idle ratio et
- *     statut sont calcules dans le WASM) ;
- *   - identite (device/type/os/transport) resolue a l'execution.
- *
- * La table native_symbols est IDENTIQUE (noms + signatures) a celle attendue
- * par le module .wasm. Toute divergence casse la portabilite binaire.
- *
  * Licence : Apache-2.0
  */
 
@@ -25,17 +14,16 @@
 #include <zephyr/net/net_mgmt.h>
 #endif
 
+#ifdef CONFIG_WAMR_BATTERY_ADC
+#include <zephyr/drivers/adc.h>
+#endif
+
 #include "wasm_export.h"
 #include "host_api.h"
 #include "transport.h"
 
 /* ----------------------------------------------------------------
  * Identite du noeud — surchargeable via Kconfig / build flags.
- *
- * - DEVICE_NAME : identifiant unique du noeud.
- * - DEVICE_TYPE : famille materielle (informative).
- * - OS_NAME     : systeme hote.
- * transport : fourni dynamiquement par transport_name() (wifi/ble).
  * ---------------------------------------------------------------- */
 #ifndef CONFIG_WAMR_NODE_DEVICE_NAME
 #define CONFIG_WAMR_NODE_DEVICE_NAME "zephyr_node"
@@ -51,9 +39,7 @@
 static void *g_pool_base;
 static size_t g_pool_size;
 
-/* Compteur de redemarrages (M10). Sans stockage persistant portable sur
- * toutes les cartes, on compte les executions depuis la mise sous tension.
- */
+/* Compteur de redemarrages (M10). */
 static uint32_t g_reset_count;
 
 void host_set_pool(void *pool, size_t size)
@@ -78,7 +64,6 @@ static void *app_ptr(wasm_module_inst_t inst, uint32_t app_offset, uint32_t len)
 	if (wasm_runtime_validate_app_addr(inst, app_offset, len)) {
 		return wasm_runtime_addr_app_to_native(inst, app_offset);
 	}
-	/* Repli : la valeur est peut-etre deja une adresse native dans le pool. */
 	uintptr_t v = (uintptr_t)app_offset;
 	if (g_pool_base &&
 	    v >= (uintptr_t)g_pool_base &&
@@ -106,16 +91,12 @@ static void h_print(wasm_exec_env_t e, char *msg, uint32_t len)
 
 /* ================================================================
  * HOST FUNCTIONS — transport abstrait
- *
- * Ces fonctions delèguent au backend transport (Wi-Fi ou BLE) sans que le
- * WASM sache lequel est actif.
  * ================================================================ */
 static int32_t h_transport_connect(wasm_exec_env_t e,
 	uint32_t ip_ptr, uint32_t ip_len, uint32_t port, uint32_t timeout)
 {
 	wasm_module_inst_t inst = wasm_runtime_get_module_inst(e);
 	const char *ip = (const char *)app_ptr(inst, ip_ptr, ip_len);
-	/* En BLE, ip peut etre NULL/ignore : on tolere. */
 	return (int32_t)transport_connect(ip ? ip : "", ip_len, port, timeout);
 }
 
@@ -217,18 +198,7 @@ static uint32_t h_transport_errors(wasm_exec_env_t e)
 	return g_tx_counters.errors;
 }
 
-/* M7 — Stack usage (%) : proxy via charge du thread courant */
-/* M7 — occupation reelle de la pile du thread courant, en %.
- *
- * ATTENTION : l'ancienne version calculait par erreur un ratio de cycles CPU
- * (via k_thread_runtime_stats), ce qui renvoyait ~100 % en permanence et
- * declenchait a tort l'alarme "pile pleine". On mesure ici la VRAIE occupation
- * de pile avec l'API dediee de Zephyr :
- *   - k_thread_stack_space_get() -> espace INUTILISE (octets restants) ;
- *   - thread->stack_info.size    -> taille totale de la pile (octets),
- *     exposee quand CONFIG_THREAD_STACK_INFO est actif.
- * usage% = (taille - inutilise) * 100 / taille.
- */
+/* M7 — occupation reelle de la pile du thread courant (%) */
 static uint32_t h_stack_usage_pct(wasm_exec_env_t e)
 {
 	ARG_UNUSED(e);
@@ -236,11 +206,8 @@ static uint32_t h_stack_usage_pct(wasm_exec_env_t e)
 	struct k_thread *self = k_current_get();
 	size_t unused = 0;
 	if (k_thread_stack_space_get(self, &unused) != 0) {
-		return 0; /* mesure indisponible : on ne declenche pas d'alarme */
+		return 0;
 	}
-	/* La taille totale de la pile est exposee par stack_info.size quand
-	 * CONFIG_THREAD_STACK_INFO est actif (il n'existe pas de fonction
-	 * k_thread_stack_size_get() dans cette version de Zephyr). */
 	size_t total = self->stack_info.size;
 	if (total == 0 || unused > total) {
 		return 0;
@@ -248,13 +215,11 @@ static uint32_t h_stack_usage_pct(wasm_exec_env_t e)
 	size_t used = total - unused;
 	return (uint32_t)((used * 100U) / total);
 #else
-	/* Sans INIT_STACKS + THREAD_STACK_INFO, l'occupation n'est pas mesurable
-	 * de facon fiable. On renvoie 0 (aucune alarme parasite). */
 	return 0;
 #endif
 }
 
-/* M9 — signal (dBm), Wi-Fi ou BLE selon le backend */
+/* M9 — signal (dBm) */
 static int32_t h_signal_dbm(wasm_exec_env_t e)
 {
 	ARG_UNUSED(e);
@@ -268,10 +233,7 @@ static uint32_t h_reset_count(wasm_exec_env_t e)
 	return g_reset_count;
 }
 
-/* M11 — active threads : nombre de threads noyau.
- * Parcourt la liste des threads si CONFIG_THREAD_MONITOR est actif ; sinon
- * retourne 1 (au moins le thread courant). Detection de fuite de threads.
- */
+/* M11 — active threads */
 #ifdef CONFIG_THREAD_MONITOR
 static void count_thread_cb(const struct k_thread *thread, void *user_data)
 {
@@ -293,9 +255,8 @@ static uint32_t h_active_threads(wasm_exec_env_t e)
 #endif
 }
 
-/* M12 — retransmissions TCP.
- * Exposees par les statistiques reseau si CONFIG_NET_STATISTICS et
- * CONFIG_NET_STATISTICS_TCP sont actifs. 0 sinon (et 0 en BLE : pas de TCP).
+/* M12 — retransmissions du lien (source de "coap_retransmissions" cote WASM).
+ * Sous Wi-Fi/TCP : compteur de segments retransmis. 0 en BLE (pas de TCP).
  */
 static uint32_t h_tcp_retransmissions(wasm_exec_env_t e)
 {
@@ -305,13 +266,54 @@ static uint32_t h_tcp_retransmissions(wasm_exec_env_t e)
 	struct net_if *iface = net_if_get_default();
 	if (iface && net_mgmt(NET_REQUEST_STATS_GET_ALL, iface,
 			      &stats, sizeof(stats)) == 0) {
-		/* Dans struct net_stats_tcp (Zephyr), le compteur de segments
-		 * retransmis se nomme "rexmit" (affiche "re-xmit" par le shell),
-		 * pas "retransmit". */
 		return (uint32_t)stats.tcp.rexmit;
 	}
 #endif
 	return 0;
+}
+
+/* M13 — tension batterie (mV). NOUVEAU.
+ * Renvoie 0 si la mesure batterie n'est pas configuree (ex. alimentation USB).
+ * Cote WASM, 0 desactive la regulation energetique (pas de mode survie force).
+ *
+ * Pour activer : CONFIG_WAMR_BATTERY_ADC=y ET fournir un overlay carte
+ * definissant le canal ADC dans le noeud "zephyr,user", par exemple :
+ *   / { zephyr,user { io-channels = <&adc 0>; }; };
+ * Adapter le facteur de pont diviseur si necessaire (ex. x2 sur Heltec).
+ */
+#ifdef CONFIG_WAMR_BATTERY_ADC
+static const struct adc_dt_spec batt_adc = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
+#endif
+
+static uint32_t h_battery_mv(wasm_exec_env_t e)
+{
+	ARG_UNUSED(e);
+#ifdef CONFIG_WAMR_BATTERY_ADC
+	if (!adc_is_ready_dt(&batt_adc)) {
+		return 0;
+	}
+	(void)adc_channel_setup_dt(&batt_adc);
+
+	int16_t raw = 0;
+	struct adc_sequence seq = {
+		.buffer = &raw,
+		.buffer_size = sizeof(raw),
+	};
+	if (adc_sequence_init_dt(&batt_adc, &seq) != 0) {
+		return 0;
+	}
+	if (adc_read_dt(&batt_adc, &seq) != 0) {
+		return 0;
+	}
+	int32_t mv = raw;
+	if (adc_raw_to_millivolts_dt(&batt_adc, &mv) != 0) {
+		return 0;
+	}
+	/* Si un pont diviseur divise la tension batterie, multiplier ici. */
+	return (uint32_t)(mv < 0 ? 0 : mv);
+#else
+	return 0;
+#endif
 }
 
 /* ================================================================
@@ -353,8 +355,7 @@ static int32_t h_get_transport_name(wasm_exec_env_t e, char *buf, uint32_t cap)
 
 /* ================================================================
  * TABLE DES SYMBOLES NATIFS
- *
- * IDENTIQUE (noms + signatures) au contrat du module .wasm.
+ * IDENTIQUE (noms + signatures) au contrat du module .wasm (ffi.rs).
  * ================================================================ */
 static NativeSymbol native_symbols[] = {
 	{ "host_print",                 h_print,                 "(*~)",    NULL },
@@ -377,6 +378,7 @@ static NativeSymbol native_symbols[] = {
 	{ "host_metric_reset_count",       h_reset_count,       "()i", NULL },
 	{ "host_metric_active_threads",       h_active_threads,       "()i", NULL },
 	{ "host_metric_tcp_retransmissions",  h_tcp_retransmissions,  "()i", NULL },
+	{ "host_metric_battery_mv",           h_battery_mv,           "()i", NULL },
 
 	{ "host_get_device_name",       h_get_device_name,       "(*~)i", NULL },
 	{ "host_get_device_type",       h_get_device_type,       "(*~)i", NULL },

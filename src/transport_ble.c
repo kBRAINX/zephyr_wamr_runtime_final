@@ -14,11 +14,7 @@
  *   2. une PASSERELLE (un PC, role central, voir gateway/ble_gateway.py) se
  *      connecte et souscrit aux notifications de la caracteristique TX ;
  *   3. l'equipement envoie les metriques par notifications NUS ;
- *   4. la passerelle relaie ces donnees vers le serveur HTTP.
- *
- * Un PC ne disposant pas de pile IP au-dessus du BLE, la passerelle est
- * indispensable : c'est elle qui transforme le flux NUS en requetes HTTP
- * comprehensibles par le serveur de collecte, exactement comme en Wi-Fi.
+ *   4. la passerelle relaie ces donnees vers le serveur.
  *
  * Licence : Apache-2.0
  */
@@ -29,8 +25,10 @@
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/sys/printk.h>
+#include <errno.h>
 #include <string.h>
 
 #include "transport.h"
@@ -68,10 +66,8 @@ static const struct bt_data sd[] = {
 static void start_advertising(void)
 {
 	/* BT_LE_ADV_CONN a ete deprecie puis retire dans les Zephyr recents
-	 * (>= 4.4) : c'etait un raccourci pour l'option BT_LE_ADV_OPT_CONNECTABLE,
-	 * elle-meme supprimee. Le remplacement officiel pour un advertising
-	 * connectable est BT_LE_ADV_CONN_FAST_1 (intervalle rapide, recommande
-	 * pour une reconnexion reactive). Voir la doc "Deprecated List" de Zephyr.
+	 * (>= 4.4). Le remplacement officiel pour un advertising connectable est
+	 * BT_LE_ADV_CONN_FAST_1 (intervalle rapide, reconnexion reactive).
 	 */
 	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
 				  sd, ARRAY_SIZE(sd));
@@ -89,7 +85,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 	current_conn = bt_conn_ref(conn);
-	printk("[ble] central connecte\n");
+	printk("[ble] central connecte (MTU initial = %u)\n",
+	       bt_gatt_get_mtu(conn));
+	/* La negociation d'un plus grand MTU est initiee par le central
+	 * (bleak/BlueZ). La fragmentation dans transport_send() fonctionne de
+	 * toute facon avec n'importe quel MTU, y compris le defaut (23).
+	 */
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -187,16 +188,43 @@ int transport_send(int handle, const uint8_t *buf, uint32_t len)
 		return -1;
 	}
 
-	/* bt_nus_send fragmente automatiquement selon le MTU negocie.
-	 * On envoie l'integralite du bloc (en-tete HTTP + JSON + '\n').
+	/* Taille utile par notification = MTU ATT - 3 octets d'en-tete.
+	 * Tant que l'echange MTU n'a pas eu lieu, MTU vaut 23 -> 20 octets utiles.
+	 * On fragmente la trame nous-memes, sans dependre de la fragmentation
+	 * interne de bt_nus_send (qui echouait en -ENOMEM sur une trame entiere).
 	 */
-	int err = bt_nus_send(current_conn, buf, (uint16_t)len);
-	if (err) {
-		g_tx_counters.errors++;
-		return -1;
+	uint16_t mtu = bt_gatt_get_mtu(current_conn);
+	uint16_t chunk = (mtu > 3) ? (uint16_t)(mtu - 3) : 20;
+
+	uint32_t sent = 0;
+	while (sent < len) {
+		uint16_t n = (len - sent > chunk) ? chunk : (uint16_t)(len - sent);
+
+		int err = bt_nus_send(current_conn, buf + sent, n);
+
+		/* Manque de buffer TX passager : on laisse la pile ecouler ses
+		 * buffers puis on reessaie le meme fragment (backoff borne).
+		 */
+		int retries = 0;
+		while (err == -ENOMEM && retries < 50) {
+			k_msleep(10);
+			err = bt_nus_send(current_conn, buf + sent, n);
+			retries++;
+		}
+
+		if (err) {
+			printk("[ble] bt_nus_send a echoue (err=%d, frag=%u, mtu=%u)\n",
+			       err, n, mtu);
+			g_tx_counters.errors++;
+			/* Envoi partiel : on rend ce qui est deja parti (> 0), sinon -1. */
+			return (sent > 0) ? (int)sent : -1;
+		}
+
+		sent += n;
 	}
-	g_tx_counters.bytes_tx += len;
-	return (int)len;
+
+	g_tx_counters.bytes_tx += sent;
+	return (int)sent;
 }
 
 int transport_recv(int handle, uint8_t *buf, uint32_t len)
@@ -223,11 +251,9 @@ void transport_close(int handle)
 
 int32_t transport_signal_dbm(void)
 {
-	/* La lecture du RSSI de connexion via HCI (bt_conn_le_get_rssi ou
-	 * commande HCI Read RSSI) n'est pas exposee de facon portable sur tous
-	 * les controleurs. On retourne la derniere valeur connue si elle a ete
-	 * captee, sinon 0. Sur STM32WB, la commande HCI Read RSSI peut etre
-	 * cablee ici si besoin ; laisse a 0 par defaut pour rester generique.
+	/* La lecture du RSSI de connexion via HCI n'est pas exposee de facon
+	 * portable sur tous les controleurs. On retourne la derniere valeur
+	 * connue si captee, sinon 0.
 	 */
 	return (int32_t)last_rssi;
 }

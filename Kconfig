@@ -65,5 +65,15 @@ config WAMR_WIFI_PSK
 	help
 	  Utilise uniquement par le backend transport Wi-Fi. Sans effet en BLE.
 
+config WAMR_BATTERY_ADC
+	bool "Activer la mesure de tension batterie (ADC)"
+	default n
+	help
+	  Active la host function host_metric_battery_mv (M13), qui lit la
+	  tension batterie via l'ADC. Nécessite un overlay carte définissant
+	  le canal ADC dans le nœud "zephyr,user". Désactivé, la métrique
+	  battery_mv vaut 0 (ex. carte alimentée par USB), et la régulation
+	  énergétique PADRE reste inactive côté WASM.
+	  
 # Rattachement a l'arbre Kconfig de Zephyr (obligatoire).
 source "Kconfig.zephyr"
