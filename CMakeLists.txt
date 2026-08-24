@@ -8,6 +8,8 @@ cmake_minimum_required(VERSION 3.20.0)
 #     (aucune valeur figee : fonctionne sur Xtensa, RISC-V, ARM...).
 #  2. Compiler le bon backend de transport (Wi-Fi ou BLE) selon la config,
 #     et refuser explicitement une config sans transport.
+#  3. (MAJ) Compiler le recepteur d'upload reseau src/net_upload.c (actif en
+#     Wi-Fi seulement, vide en BLE).
 # ============================================================================
 
 set(WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../wasm-micro-runtime)
@@ -131,6 +133,7 @@ target_sources(app PRIVATE
   src/host_api.c
   src/transport_wifi.c
   src/transport_ble.c
+  src/net_upload.c
 )
 
 target_include_directories(app PRIVATE

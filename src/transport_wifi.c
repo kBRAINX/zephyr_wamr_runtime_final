@@ -1,9 +1,16 @@
 /*
  * src/transport_wifi.c — Backend de transport Wi-Fi + TCP
  *
- * Compile UNIQUEMENT lorsque CONFIG_WIFI est actif. Sur une carte sans
- * Wi-Fi (ex. NUCLEO-WB55RG), ce fichier se reduit a du vide et n'introduit
- * aucune dependance : le Wi-Fi n'est donc jamais une exigence stricte.
+ * Compile UNIQUEMENT lorsque CONFIG_WIFI est actif.
+ *
+ * MISE A JOUR (upload reseau)
+ * ---------------------------
+ * L'association Wi-Fi + l'obtention d'adresse IP sont desormais factorisees
+ * dans transport_wifi_bring_up(), appelable AVANT l'execution de la sonde
+ * (par main.c) pour permettre la reception du .wasm par TCP. Un drapeau
+ * g_wifi_up evite toute DOUBLE association : si le Wi-Fi a deja ete monte pour
+ * l'upload, la sonde (via transport_connect / transport_wait_ready) le
+ * reutilise tel quel au lieu de se reconnecter.
  *
  * Licence : Apache-2.0
  */
@@ -22,12 +29,6 @@
 
 #include "transport.h"
 
-/* SSID / mot de passe du point d'acces.
- * Ce sont des parametres d'INFRASTRUCTURE (pas de l'equipement) : ils sont
- * identiques pour tous les noeuds Wi-Fi d'une campagne. Ils sont ici, cote
- * firmware, plutot que dans le WASM, pour que le .wasm reste agnostique du
- * transport. Adaptez-les a votre reseau, ou surchargez-les via Kconfig.
- */
 #ifndef CONFIG_WAMR_WIFI_SSID
 #define CONFIG_WAMR_WIFI_SSID "a26nguep-hotspot"
 #endif
@@ -39,6 +40,8 @@ struct transport_counters g_tx_counters = {0, 0, 0};
 
 static K_SEM_DEFINE(wifi_ip_ready, 0, 1);
 static struct net_mgmt_event_callback dhcp_cb;
+static bool g_cb_added;      /* callback DHCP enregistre une seule fois */
+static bool g_wifi_up;       /* Wi-Fi associe ET adresse IP obtenue */
 
 /* Cible TCP memorisee entre transport_connect() et le premier envoi. */
 static char g_ip[32];
@@ -61,19 +64,21 @@ static void on_dhcp(struct net_mgmt_event_callback *cb,
 	}
 }
 
-int transport_connect(const char *ip, size_t ip_len,
-		      uint32_t port, uint32_t timeout_secs)
+/* Lance l'association Wi-Fi + le client DHCP (sans attendre l'IP). */
+static int wifi_associate(void)
 {
 	struct net_if *iface = net_if_get_default();
-
 	if (!iface) {
 		printk("[wifi] aucune interface reseau\n");
 		return -1;
 	}
 
-	net_mgmt_init_event_callback(&dhcp_cb, on_dhcp,
-				     NET_EVENT_IPV4_DHCP_BOUND);
-	net_mgmt_add_event_callback(&dhcp_cb);
+	if (!g_cb_added) {
+		net_mgmt_init_event_callback(&dhcp_cb, on_dhcp,
+					     NET_EVENT_IPV4_DHCP_BOUND);
+		net_mgmt_add_event_callback(&dhcp_cb);
+		g_cb_added = true;
+	}
 
 	struct wifi_connect_req_params params = {
 		.ssid = (const uint8_t *)CONFIG_WAMR_WIFI_SSID,
@@ -87,15 +92,6 @@ int transport_connect(const char *ip, size_t ip_len,
 		.timeout = SYS_FOREVER_MS,
 	};
 
-	/* La cible TCP est memorisee ici ; le socket reel est ouvert au premier
-	 * envoi (ensure_socket), une fois l'adresse IP obtenue.
-	 */
-	uint32_t n = ip_len < sizeof(g_ip) - 1 ? ip_len : sizeof(g_ip) - 1;
-	memcpy(g_ip, ip, n);
-	g_ip[n] = '\0';
-	g_port = port;
-	g_sock_timeout = timeout_secs;
-
 	printk("[wifi] connexion a \"%s\"...\n", CONFIG_WAMR_WIFI_SSID);
 	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface,
 			   &params, sizeof(params));
@@ -104,24 +100,70 @@ int transport_connect(const char *ip, size_t ip_len,
 		return -1;
 	}
 	net_dhcpv4_start(iface);
+	return 0;
+}
 
-	/* handle 0 = connexion logique Wi-Fi etablie, socket a la demande. */
+/* Monte le Wi-Fi (association + IP) et attend l'adresse. Reutilisable :
+ * si deja monte, retourne immediatement. Utilise par l'upload reseau.
+ */
+int transport_wifi_bring_up(uint32_t timeout_secs)
+{
+	if (g_wifi_up) {
+		return 0;
+	}
+	if (wifi_associate() != 0) {
+		return -1;
+	}
+	if (k_sem_take(&wifi_ip_ready, K_SECONDS(timeout_secs)) != 0) {
+		printk("[wifi] pas d'adresse IP (timeout bring-up)\n");
+		return -1;
+	}
+	g_wifi_up = true;
+	printk("[wifi] adresse IP obtenue (bring-up reseau)\n");
+	return 0;
+}
+
+bool transport_wifi_is_up(void)
+{
+	return g_wifi_up;
+}
+
+int transport_connect(const char *ip, size_t ip_len,
+		      uint32_t port, uint32_t timeout_secs)
+{
+	/* Memorise la cible TCP ; le socket reel est ouvert au premier envoi. */
+	uint32_t n = ip_len < sizeof(g_ip) - 1 ? ip_len : sizeof(g_ip) - 1;
+	memcpy(g_ip, ip, n);
+	g_ip[n] = '\0';
+	g_port = port;
+	g_sock_timeout = timeout_secs;
+
+	/* Si le Wi-Fi a deja ete monte (upload reseau), on le REUTILISE : pas de
+	 * seconde association. Sinon (upload via UART), on l'associe maintenant.
+	 */
+	if (!g_wifi_up) {
+		if (wifi_associate() != 0) {
+			return -1;
+		}
+	}
 	return 0;
 }
 
 int transport_wait_ready(uint32_t timeout_secs)
 {
+	if (g_wifi_up) {
+		return 0;   /* deja pret (monte pour l'upload) */
+	}
 	if (k_sem_take(&wifi_ip_ready, K_SECONDS(timeout_secs)) != 0) {
 		printk("[wifi] pas d'adresse IP (timeout)\n");
 		return -1;
 	}
+	g_wifi_up = true;
 	printk("[wifi] adresse IP obtenue\n");
 	return 0;
 }
 
-/* Ouvre reellement le socket TCP au premier envoi. Le handle expose au WASM
- * reste stable (0) ; g_fd porte le vrai descripteur.
- */
+/* Ouvre reellement le socket TCP au premier envoi. */
 static int ensure_socket(void)
 {
 	if (g_fd >= 0) {
@@ -156,25 +198,16 @@ static int ensure_socket(void)
 int transport_send(int handle, const uint8_t *buf, uint32_t len)
 {
 	ARG_UNUSED(handle);
-	/* HTTP/1.0 + Connection: close : un socket neuf par envoi. */
 	int fd = ensure_socket();
 	if (fd < 0) {
 		return -1;
 	}
 
-	/* IMPORTANT : zsock_send() peut faire un envoi PARTIEL (renvoyer moins
-	 * que 'len'), surtout pour des charges utiles de plusieurs centaines
-	 * d'octets. Si on n'envoie pas la totalite, la requete HTTP arrive
-	 * tronquee cote serveur, qui attend alors le reste du corps annonce par
-	 * Content-Length et finit par timeouter. On boucle donc jusqu'a avoir
-	 * tout emis.
-	 */
 	uint32_t total_sent = 0;
 	while (total_sent < len) {
 		int n = zsock_send(fd, buf + total_sent, len - total_sent, 0);
 		if (n <= 0) {
 			g_tx_counters.errors++;
-			/* Socket casse : on le ferme pour repartir proprement. */
 			zsock_close(g_fd);
 			g_fd = -1;
 			return (total_sent > 0) ? (int)total_sent : -1;
@@ -197,7 +230,6 @@ int transport_recv(int handle, uint8_t *buf, uint32_t len)
 	} else if (received < 0) {
 		g_tx_counters.errors++;
 	}
-	/* Connection: close -> on ferme apres l'ACK pour le prochain cycle. */
 	zsock_close(g_fd);
 	g_fd = -1;
 	return received;

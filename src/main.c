@@ -1,18 +1,21 @@
 /*
  * src/main.c — Firmware hote Zephyr generique, multi-transport (Wi-Fi / BLE)
  *
- * Ce fichier ne contient AUCUN code specifique a un transport ni a une carte.
- * Il se contente de :
- *   1. initialiser le runtime WAMR (pool memoire) ;
- *   2. enregistrer les fonctions hotes (couche host_api, qui delegue au
- *      backend transport compile : Wi-Fi OU BLE) ;
- *   3. recevoir un module .wasm par UART (4 octets de taille little-endian
- *      suivis du binaire) ;
- *   4. l'executer.
+ * Ce fichier initialise WAMR, enregistre les fonctions hotes, RECOIT un module
+ * .wasm puis l'execute.
  *
- * Le choix du transport est fait a la COMPILATION via la configuration
- * (voir conf/wifi.conf et conf/ble.conf) : ce fichier est identique quel que
- * soit le transport.
+ * MISE A JOUR (upload reseau)
+ * ---------------------------
+ * En CONFIG WI-FI, le module .wasm peut desormais etre recu par DEUX voies :
+ *   - l'UART (comme auparavant), ou
+ *   - le RESEAU (TCP), la carte agissant en serveur d'upload (port 5555).
+ * Le firmware ecoute les DEUX simultanement : la premiere voie qui livre un
+ * module l'emporte. Pour rendre l'upload TCP possible, le Wi-Fi est monte ICI,
+ * cote hote, AVANT l'attente (bootstrap reseau) ; la sonde WASM reutilise
+ * ensuite cette connexion (cf. transport_wifi.c, drapeau g_wifi_up).
+ *
+ * En CONFIG BLE (pas de CONFIG_WIFI), rien ne change : seul le chemin UART est
+ * compile, a l'identique de la version precedente.
  *
  * Licence : Apache-2.0
  */
@@ -26,15 +29,16 @@
 #include "wasm_export.h"
 #include "host_api.h"
 
+#if defined(CONFIG_WIFI)
+#include "transport.h"
+#include "net_upload.h"
+#define UPLOAD_TCP_PORT      5555   /* port d'ecoute pour l'upload reseau */
+#define WIFI_BRINGUP_SECS    20     /* delai max de montee du Wi-Fi au boot */
+#endif
+
 #define UART_NODE DT_CHOSEN(zephyr_console)
 
-/* Tailles WAMR configurables par carte via Kconfig (voir Kconfig du projet).
- * Cela permet d'adapter l'empreinte memoire a chaque equipement :
- *  - Heltec/ESP32-S3, ESP32-C6 : beaucoup de RAM -> gros pool (160 Ko) ;
- *  - NUCLEO-WB55RG : seulement ~192 Ko de RAM applicative, dont une partie
- *    prise par la pile BLE -> pool reduit, sinon l'edition de liens deborde.
- * Les valeurs par defaut (si non definies) conviennent aux cartes a large RAM.
- */
+/* Tailles WAMR configurables par carte via Kconfig. */
 #ifndef CONFIG_WAMR_APP_POOL_SIZE_KB
 #define CONFIG_WAMR_APP_POOL_SIZE_KB 160
 #endif
@@ -57,6 +61,10 @@ static uint8_t wasm_buffer[WASM_MAX_SIZE];
 static char wamr_pool[WAMR_POOL_SIZE] __aligned(8);
 
 static const struct device *uart_dev;
+
+/* --------------------------------------------------------------------------
+ * Reception UART (inchangee) : protocole [taille(4 LE)][binaire].
+ * -------------------------------------------------------------------------- */
 
 static void uart_read_byte(const struct device *dev, uint8_t *out)
 {
@@ -85,6 +93,42 @@ static void uart_drain_rx(const struct device *dev)
 	} while (rounds < 5);
 	printk("UART resync OK\n");
 }
+
+/* Recoit taille + corps a partir d'un premier octet DEJA lu (detection UART).
+ * Retourne true si un module valide a ete recu dans wasm_buffer.
+ */
+static bool uart_receive_module(const struct device *dev, uint8_t first,
+				uint32_t *size_out)
+{
+	uint32_t wasm_size = 0;
+	((uint8_t *)&wasm_size)[0] = first;
+	for (int i = 1; i < 4; i++) {
+		uint8_t b;
+		uart_read_byte(dev, &b);
+		((uint8_t *)&wasm_size)[i] = b;
+	}
+	printk("Incoming size = %u bytes\n", wasm_size);
+
+	if (wasm_size == 0 || wasm_size > WASM_MAX_SIZE) {
+		printk("ERROR: invalid size (0 < size <= %d)\n", WASM_MAX_SIZE);
+		uart_drain_rx(dev);
+		return false;
+	}
+
+	for (uint32_t i = 0; i < wasm_size; i++) {
+		uart_read_byte(dev, &wasm_buffer[i]);
+	}
+	printk("Upload complete (%u bytes)\n", wasm_size);
+	*size_out = wasm_size;
+	return true;
+}
+
+/* --------------------------------------------------------------------------
+ * Execution du module WASM (inchangee).
+ *
+ * NB : wasm_data est un uint8_t* NON const, car wasm_runtime_load() attend un
+ * pointeur non const (sinon avertissement -Wdiscarded-qualifiers).
+ * -------------------------------------------------------------------------- */
 
 static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
 {
@@ -140,6 +184,10 @@ unload:
 	wasm_runtime_unload(module);
 }
 
+/* --------------------------------------------------------------------------
+ * Programme principal.
+ * -------------------------------------------------------------------------- */
+
 int main(void)
 {
 	printk("\n");
@@ -172,34 +220,73 @@ int main(void)
 		return -1;
 	}
 
-	printk("\n===== UART DEPLOYMENT — Metrics Edition =====\n");
+	bool net_ready = false;
+
+#if defined(CONFIG_WIFI)
+	/* Bootstrap reseau : on tente de monter le Wi-Fi pour autoriser l'upload
+	 * TCP. En cas d'echec (pas d'AP), on retombe sur l'UART uniquement. */
+	printk("[boot] config Wi-Fi : montee du reseau pour l'upload...\n");
+	if (transport_wifi_bring_up(WIFI_BRINGUP_SECS) == 0) {
+		if (net_upload_init(UPLOAD_TCP_PORT) == 0) {
+			net_ready = true;
+			printk("[boot] upload reseau actif (port TCP %d)\n",
+			       UPLOAD_TCP_PORT);
+		}
+	} else {
+		printk("[boot] Wi-Fi indisponible : upload par UART uniquement\n");
+	}
+#endif
+
+	printk("\n===== DEPLOYMENT — Metrics Edition =====\n");
 	printk("Protocol : 4 bytes size (LE) + wasm binary\n");
 	printk("Max size : %d bytes\n", WASM_MAX_SIZE);
+#if defined(CONFIG_WIFI)
+	printk("Voies    : %s\n", net_ready ? "UART + reseau (TCP)" : "UART");
+#else
+	printk("Voies    : UART\n");
+#endif
 
+	/* Boucle d'attente : on sonde l'UART puis, en Wi-Fi, le reseau.
+	 * La premiere voie qui livre un module complet l'emporte. */
 	while (1) {
 		uint32_t wasm_size = 0;
-		printk("\nWaiting upload...\n");
+		bool got = false;
 
-		for (int i = 0; i < 4; i++) {
-			uint8_t b;
-			uart_read_byte(uart_dev, &b);
-			((uint8_t *)&wasm_size)[i] = b;
-		}
-		printk("Incoming size = %u bytes\n", wasm_size);
-
-		if (wasm_size == 0 || wasm_size > WASM_MAX_SIZE) {
-			printk("ERROR: invalid size (0 < size <= %d)\n",
-			       WASM_MAX_SIZE);
-			uart_drain_rx(uart_dev);
-			continue;
+		/* 1) UART : sondage non bloquant du premier octet. */
+		uint8_t first;
+		if (uart_poll_in(uart_dev, &first) == 0) {
+			if (uart_receive_module(uart_dev, first, &wasm_size)) {
+				got = true;
+			}
 		}
 
-		for (uint32_t i = 0; i < wasm_size; i++) {
-			uart_read_byte(uart_dev, &wasm_buffer[i]);
+#if defined(CONFIG_WIFI)
+		/* 2) Reseau : sondage court d'un client TCP. */
+		if (!got && net_ready) {
+			int r = net_upload_try(wasm_buffer, WASM_MAX_SIZE,
+					       &wasm_size);
+			if (r == 1) {
+				got = true;
+			}
 		}
-		printk("Upload complete (%u bytes)\n", wasm_size);
+#endif
 
-		execute_wasm(wasm_buffer, wasm_size);
+		if (got) {
+			execute_wasm(wasm_buffer, wasm_size);
+			/* La sonde boucle indefiniment : en pratique on ne
+			 * revient pas ici. Si le module s'arrete (erreur), on
+			 * se remet en attente d'un nouvel upload. */
+			printk("\nWaiting upload...\n");
+		} else {
+#if defined(CONFIG_WIFI)
+			if (!net_ready) {
+				k_msleep(20);
+			}
+			/* Si net_ready, net_upload_try() a deja temporise (poll). */
+#else
+			k_msleep(20);
+#endif
+		}
 	}
 
 	return 0;
