@@ -1,5 +1,12 @@
 /*
- * src/host_api.c — Couche hote WAMR (transport abstrait + metriques + identite)
+ * 	Couche hote WAMR (transport abstrait + metriques + identite)
+ *
+ * MISE A JOUR (hot-update) :
+ *   - host_poll_update : sonde le reseau (via deploy_try_stage) et retourne 1
+ *     si un nouveau module .wasm est desormais en attente. La sonde l'appelle
+ *     periodiquement ; sur retour 1, elle rend la main proprement.
+ *   - host_metric_update_count : expose le nombre de mises a jour a chaud
+ *     (metrique, distincte de reset_count).
  *
  * Licence : Apache-2.0
  */
@@ -21,6 +28,7 @@
 #include "wasm_export.h"
 #include "host_api.h"
 #include "transport.h"
+#include "deploy.h"
 
 /* ----------------------------------------------------------------
  * Identite du noeud — surchargeable via Kconfig / build flags.
@@ -143,6 +151,27 @@ static void h_sleep(wasm_exec_env_t e, uint32_t secs)
 }
 
 /* ================================================================
+ * HOST FUNCTIONS — mise a jour a chaud (hot-update)
+ * ================================================================ */
+
+/* Sonde le reseau et retourne 1 si un nouveau module attend d'etre charge.
+ * En BLE (pas de CONFIG_WIFI), deploy_try_stage renvoie toujours 0 : la sonde
+ * ne detecte jamais de mise a jour et tourne jusqu'au prochain reset. */
+static int32_t h_poll_update(wasm_exec_env_t e)
+{
+	ARG_UNUSED(e);
+	deploy_try_stage();
+	return (int32_t)deploy_pending();
+}
+
+/* Nombre de mises a jour a chaud depuis le demarrage (metrique). */
+static uint32_t h_update_count(wasm_exec_env_t e)
+{
+	ARG_UNUSED(e);
+	return deploy_update_count();
+}
+
+/* ================================================================
  * HOST FUNCTIONS — metriques BRUTES (aucun calcul derive ici)
  * ================================================================ */
 
@@ -255,9 +284,7 @@ static uint32_t h_active_threads(wasm_exec_env_t e)
 #endif
 }
 
-/* M12 — retransmissions du lien (source de "coap_retransmissions" cote WASM).
- * Sous Wi-Fi/TCP : compteur de segments retransmis. 0 en BLE (pas de TCP).
- */
+/* M12 — retransmissions du lien (source de "coap_retransmissions" cote WASM). */
 static uint32_t h_tcp_retransmissions(wasm_exec_env_t e)
 {
 	ARG_UNUSED(e);
@@ -272,15 +299,7 @@ static uint32_t h_tcp_retransmissions(wasm_exec_env_t e)
 	return 0;
 }
 
-/* M13 — tension batterie (mV). NOUVEAU.
- * Renvoie 0 si la mesure batterie n'est pas configuree (ex. alimentation USB).
- * Cote WASM, 0 desactive la regulation energetique (pas de mode survie force).
- *
- * Pour activer : CONFIG_WAMR_BATTERY_ADC=y ET fournir un overlay carte
- * definissant le canal ADC dans le noeud "zephyr,user", par exemple :
- *   / { zephyr,user { io-channels = <&adc 0>; }; };
- * Adapter le facteur de pont diviseur si necessaire (ex. x2 sur Heltec).
- */
+/* M13 — tension batterie (mV). 0 si non configuree. */
 #ifdef CONFIG_WAMR_BATTERY_ADC
 static const struct adc_dt_spec batt_adc = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
 #endif
@@ -309,7 +328,6 @@ static uint32_t h_battery_mv(wasm_exec_env_t e)
 	if (adc_raw_to_millivolts_dt(&batt_adc, &mv) != 0) {
 		return 0;
 	}
-	/* Si un pont diviseur divise la tension batterie, multiplier ici. */
 	return (uint32_t)(mv < 0 ? 0 : mv);
 #else
 	return 0;
@@ -366,6 +384,10 @@ static NativeSymbol native_symbols[] = {
 	{ "host_transport_recv",        h_transport_recv,        "(iii)i",  NULL },
 	{ "host_transport_close",       h_transport_close,       "(i)",     NULL },
 	{ "host_sleep",                 h_sleep,                 "(i)",     NULL },
+
+	/* --- Mise a jour a chaud --- */
+	{ "host_poll_update",           h_poll_update,           "()i", NULL },
+	{ "host_metric_update_count",   h_update_count,          "()i", NULL },
 
 	{ "host_metric_cpu_usage",         h_cpu_usage,         "()i", NULL },
 	{ "host_metric_free_heap",         h_free_heap,         "()i", NULL },

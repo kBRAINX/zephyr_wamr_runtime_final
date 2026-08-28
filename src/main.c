@@ -1,21 +1,27 @@
 /*
  * src/main.c — Firmware hote Zephyr generique, multi-transport (Wi-Fi / BLE)
  *
- * Ce fichier initialise WAMR, enregistre les fonctions hotes, RECOIT un module
- * .wasm puis l'execute.
+ * Reception d'un module .wasm puis execution, avec MISE A JOUR A CHAUD en
+ * config Wi-Fi.
  *
- * MISE A JOUR (upload reseau)
- * ---------------------------
- * En CONFIG WI-FI, le module .wasm peut desormais etre recu par DEUX voies :
- *   - l'UART (comme auparavant), ou
- *   - le RESEAU (TCP), la carte agissant en serveur d'upload (port 5555).
- * Le firmware ecoute les DEUX simultanement : la premiere voie qui livre un
- * module l'emporte. Pour rendre l'upload TCP possible, le Wi-Fi est monte ICI,
- * cote hote, AVANT l'attente (bootstrap reseau) ; la sonde WASM reutilise
- * ensuite cette connexion (cf. transport_wifi.c, drapeau g_wifi_up).
+ * MISE A JOUR A CHAUD (hot-update)
+ * --------------------------------
+ * Modele COOPERATIF a un seul fil d'execution :
+ *   - la sonde WASM interroge periodiquement le reseau (host_poll_update) ;
+ *   - si un nouveau .wasm arrive, il est recu dans un SECOND buffer (staging)
+ *     et un drapeau est leve ;
+ *   - la sonde, informee, sort proprement de sa boucle (return), sans etre
+ *     interrompue en plein appel hote ;
+ *   - le firmware reprend la main, DETRUIT l'instance WASM courante, bascule
+ *     le buffer de staging en buffer courant, incremente update_count, puis
+ *     charge et execute le nouveau module.
  *
- * En CONFIG BLE (pas de CONFIG_WIFI), rien ne change : seul le chemin UART est
- * compile, a l'identique de la version precedente.
+ * Repli : si le nouveau module est invalide (chargement echoue), on ne fait
+ * pas de rollback ; la carte retourne en attente d'un autre upload (elle
+ * reste joignable). Le module fautif est simplement ignore.
+ *
+ * En CONFIG BLE (pas de CONFIG_WIFI), la mise a jour a chaud n'existe pas :
+ * upload par UART, avec redemarrage, exactement comme avant.
  *
  * Licence : Apache-2.0
  */
@@ -28,6 +34,7 @@
 
 #include "wasm_export.h"
 #include "host_api.h"
+#include "deploy.h"
 
 #if defined(CONFIG_WIFI)
 #include "transport.h"
@@ -57,10 +64,54 @@
 #define HEAP_SIZE      (CONFIG_WAMR_APP_HEAP_KB      * 1024)
 #define WAMR_POOL_SIZE (CONFIG_WAMR_APP_POOL_SIZE_KB * 1024)
 
-static uint8_t wasm_buffer[WASM_MAX_SIZE];
+/* --- Deux buffers d'octets (module courant + module en attente) -------------
+ * On alterne les pointeurs g_cur / g_stage a chaque mise a jour : pas de copie,
+ * juste un echange de pointeurs. Seuls des OCTETS coexistent, jamais deux
+ * instances WASM.
+ */
+static uint8_t wasm_buf_a[WASM_MAX_SIZE];
+static uint8_t wasm_buf_b[WASM_MAX_SIZE];
+static uint8_t *g_cur   = wasm_buf_a;   /* module en cours d'execution */
+static uint8_t *g_stage = wasm_buf_b;   /* module recu, en attente     */
+static uint32_t g_cur_size;
+static uint32_t g_stage_size;
+static volatile bool g_pending;         /* un module attend d'etre charge */
+static uint32_t g_update_count;         /* nb de mises a jour a chaud     */
+
 static char wamr_pool[WAMR_POOL_SIZE] __aligned(8);
 
 static const struct device *uart_dev;
+
+/* ==========================================================================
+ * Contrat de deploiement (declare dans deploy.h, appele par host_api.c).
+ * ========================================================================== */
+
+int deploy_try_stage(void)
+{
+#if defined(CONFIG_WIFI)
+	if (g_pending) {
+		return 1;   /* deja un module en attente : on n'en recoit pas un 2e */
+	}
+	uint32_t sz = 0;
+	int r = net_upload_try(g_stage, WASM_MAX_SIZE, &sz);
+	if (r == 1) {
+		g_stage_size = sz;
+		g_pending = true;
+		return 1;
+	}
+#endif
+	return 0;
+}
+
+int deploy_pending(void)
+{
+	return g_pending ? 1 : 0;
+}
+
+uint32_t deploy_update_count(void)
+{
+	return g_update_count;
+}
 
 /* --------------------------------------------------------------------------
  * Reception UART (inchangee) : protocole [taille(4 LE)][binaire].
@@ -94,11 +145,11 @@ static void uart_drain_rx(const struct device *dev)
 	printk("UART resync OK\n");
 }
 
-/* Recoit taille + corps a partir d'un premier octet DEJA lu (detection UART).
- * Retourne true si un module valide a ete recu dans wasm_buffer.
+/* Recoit taille + corps a partir d'un premier octet DEJA lu, dans `dst`.
+ * Retourne true si un module valide a ete recu.
  */
 static bool uart_receive_module(const struct device *dev, uint8_t first,
-				uint32_t *size_out)
+				uint8_t *dst, uint32_t *size_out)
 {
 	uint32_t wasm_size = 0;
 	((uint8_t *)&wasm_size)[0] = first;
@@ -116,7 +167,7 @@ static bool uart_receive_module(const struct device *dev, uint8_t first,
 	}
 
 	for (uint32_t i = 0; i < wasm_size; i++) {
-		uart_read_byte(dev, &wasm_buffer[i]);
+		uart_read_byte(dev, &dst[i]);
 	}
 	printk("Upload complete (%u bytes)\n", wasm_size);
 	*size_out = wasm_size;
@@ -124,26 +175,29 @@ static bool uart_receive_module(const struct device *dev, uint8_t first,
 }
 
 /* --------------------------------------------------------------------------
- * Execution du module WASM (inchangee).
+ * Execution d'un module WASM. Retourne true si le module a ete charge et
+ * execute (fin normale ou exception), false si le CHARGEMENT a echoue
+ * (module invalide/corrompu) -> repli.
  *
- * NB : wasm_data est un uint8_t* NON const, car wasm_runtime_load() attend un
- * pointeur non const (sinon avertissement -Wdiscarded-qualifiers).
+ * NB : wasm_data est un uint8_t* NON const (wasm_runtime_load l'exige).
  * -------------------------------------------------------------------------- */
 
-static void execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
+static bool execute_wasm(uint8_t *wasm_data, uint32_t wasm_size)
 {
 	char error_buf[128];
 	wasm_module_t module = NULL;
 	wasm_module_inst_t inst = NULL;
 	wasm_exec_env_t exec_env = NULL;
 	wasm_function_inst_t func = NULL;
+	bool loaded = false;
 
 	module = wasm_runtime_load(wasm_data, wasm_size,
 				   error_buf, sizeof(error_buf));
 	if (!module) {
 		printk("LOAD ERROR: %s\n", error_buf);
-		return;
+		return false;   /* module invalide -> repli */
 	}
+	loaded = true;
 	printk("Module charge OK\n");
 
 	inst = wasm_runtime_instantiate(module, STACK_SIZE, HEAP_SIZE,
@@ -182,6 +236,45 @@ deinstantiate:
 	wasm_runtime_deinstantiate(inst);
 unload:
 	wasm_runtime_unload(module);
+	return loaded;
+}
+
+/* --------------------------------------------------------------------------
+ * Cycle de vie d'execution avec mise a jour a chaud.
+ *
+ * Execute g_cur ; a la sortie de la sonde, si un module est en attente
+ * (g_pending, leve par la sonde via host_poll_update), on bascule dessus et
+ * on recommence. Sinon on rend la main (retour a l'attente d'un nouvel upload).
+ * -------------------------------------------------------------------------- */
+
+static void run_with_hot_update(void)
+{
+	bool keep = true;
+	while (keep) {
+		bool loaded = execute_wasm(g_cur, g_cur_size);
+
+		if (g_pending) {
+			/* Un module attend : on bascule (echange de pointeurs). */
+			uint8_t *tmp = g_cur;
+			g_cur = g_stage;
+			g_stage = tmp;
+			g_cur_size = g_stage_size;
+			g_pending = false;
+			g_update_count++;
+			printk("\n[deploy] MISE A JOUR A CHAUD #%u (%u octets)\n",
+			       g_update_count, g_cur_size);
+			/* on boucle : execution du nouveau module */
+		} else if (!loaded) {
+			/* Module courant invalide et rien en attente : repli. */
+			printk("[deploy] module invalide, retour en attente\n");
+			keep = false;
+		} else {
+			/* Sonde terminee sans mise a jour (arret propre/erreur) :
+			 * retour a l'attente d'un nouvel upload. */
+			printk("\nWaiting upload...\n");
+			keep = false;
+		}
+	}
 }
 
 /* --------------------------------------------------------------------------
@@ -192,7 +285,7 @@ int main(void)
 {
 	printk("\n");
 	printk("========================================================\n");
-	printk(" Firmware WAMR multi-transport (Wi-Fi / BLE)\n");
+	printk(" Firmware WAMR multi-transport (Wi-Fi / BLE) + hot-update\n");
 	printk("========================================================\n");
 
 	RuntimeInitArgs init_args;
@@ -223,8 +316,7 @@ int main(void)
 	bool net_ready = false;
 
 #if defined(CONFIG_WIFI)
-	/* Bootstrap reseau : on tente de monter le Wi-Fi pour autoriser l'upload
-	 * TCP. En cas d'echec (pas d'AP), on retombe sur l'UART uniquement. */
+	/* Bootstrap reseau : on monte le Wi-Fi pour autoriser l'upload TCP. */
 	printk("[boot] config Wi-Fi : montee du reseau pour l'upload...\n");
 	if (transport_wifi_bring_up(WIFI_BRINGUP_SECS) == 0) {
 		if (net_upload_init(UPLOAD_TCP_PORT) == 0) {
@@ -237,46 +329,46 @@ int main(void)
 	}
 #endif
 
-	printk("\n===== DEPLOYMENT — Metrics Edition =====\n");
+	printk("\n===== DEPLOYMENT — Metrics Edition (hot-update) =====\n");
 	printk("Protocol : 4 bytes size (LE) + wasm binary\n");
 	printk("Max size : %d bytes\n", WASM_MAX_SIZE);
 #if defined(CONFIG_WIFI)
 	printk("Voies    : %s\n", net_ready ? "UART + reseau (TCP)" : "UART");
+	printk("Hot-update : %s\n", net_ready ? "actif (reseau)" : "inactif");
 #else
 	printk("Voies    : UART\n");
+	printk("Hot-update : inactif (BLE)\n");
 #endif
 
-	/* Boucle d'attente : on sonde l'UART puis, en Wi-Fi, le reseau.
-	 * La premiere voie qui livre un module complet l'emporte. */
+	/* Boucle d'attente du PREMIER module : UART puis, en Wi-Fi, reseau.
+	 * Le module initial est recu dans le buffer courant g_cur. */
 	while (1) {
-		uint32_t wasm_size = 0;
 		bool got = false;
 
 		/* 1) UART : sondage non bloquant du premier octet. */
 		uint8_t first;
 		if (uart_poll_in(uart_dev, &first) == 0) {
-			if (uart_receive_module(uart_dev, first, &wasm_size)) {
+			if (uart_receive_module(uart_dev, first,
+						g_cur, &g_cur_size)) {
 				got = true;
 			}
 		}
 
 #if defined(CONFIG_WIFI)
-		/* 2) Reseau : sondage court d'un client TCP. */
+		/* 2) Reseau : sondage court d'un client TCP (dans g_cur). */
 		if (!got && net_ready) {
-			int r = net_upload_try(wasm_buffer, WASM_MAX_SIZE,
-					       &wasm_size);
+			uint32_t sz = 0;
+			int r = net_upload_try(g_cur, WASM_MAX_SIZE, &sz);
 			if (r == 1) {
+				g_cur_size = sz;
 				got = true;
 			}
 		}
 #endif
 
 		if (got) {
-			execute_wasm(wasm_buffer, wasm_size);
-			/* La sonde boucle indefiniment : en pratique on ne
-			 * revient pas ici. Si le module s'arrete (erreur), on
-			 * se remet en attente d'un nouvel upload. */
-			printk("\nWaiting upload...\n");
+			/* Execution + mises a jour a chaud successives. */
+			run_with_hot_update();
 		} else {
 #if defined(CONFIG_WIFI)
 			if (!net_ready) {
