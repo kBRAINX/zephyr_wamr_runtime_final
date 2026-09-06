@@ -32,6 +32,17 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(wamr_multitransport)
 
 # ----------------------------------------------------------------------------
+# (SIMULATION) Choix du profil d'equipement au build :
+#   west build ... -- -DSIM_EQUIP_ID=3
+# Transmet la valeur au preprocesseur C (macro SIM_EQUIP_ID dans host_api.c).
+# Sans -D, le defaut #ifndef SIM_EQUIP_ID -> 0 s'applique.
+# ----------------------------------------------------------------------------
+if(DEFINED SIM_EQUIP_ID)
+  add_compile_definitions(SIM_EQUIP_ID=${SIM_EQUIP_ID})
+  message(STATUS "SIMULATION : profil equipement = ${SIM_EQUIP_ID}")
+endif()
+
+# ----------------------------------------------------------------------------
 # 1. DETECTION AUTOMATIQUE DE L'ARCHITECTURE WAMR
 #
 # Les symboles CONFIG_* sont disponibles APRES find_package(Zephyr).
